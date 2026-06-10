@@ -1,14 +1,3 @@
-//
-//  WebRTCManager.swift
-//  janus-test
-//
-//  Created by jameel on 03/03/26.
-//
-
-// WebRTCManager.swift
-// Manages per-handle PeerConnections (publisher + N subscriber connections).
-// One instance per room handle pair.
-
 import Foundation
 import WebRTC
 
@@ -35,13 +24,19 @@ final class WebRTCManager: NSObject {
     private var feedIdMap: [UInt64: UInt64] = [:]  // handleId -> feedId (for subscribers)
     private let pcLock = NSLock()
 
-    private static let iceServers: [RTCIceServer] = [
-        RTCIceServer(urlStrings: ["stun:stun.l.google.com:19302"]),
-        RTCIceServer(urlStrings: ["stun:stun1.l.google.com:19302"])
-    ]
+    // MARK: - Private
+    #if targetEnvironment(simulator)
+    private var simulatorPlugin: (any SimulatorStreamPlugin)? = SolidColorSimulatorPlugin()
+    private var simulatorCapturer: RTCVideoCapturer?
+    #endif
+    
+    private var currentCameraPosition: AVCaptureDevice.Position = .front
+    
+    var config0: SDKConfig
 
     // MARK: - Init
-    override init() {
+    init(config:SDKConfig) {
+        self.config0  = config
         RTCInitializeSSL()
         let encoderFactory = RTCDefaultVideoEncoderFactory()
         let decoderFactory = RTCDefaultVideoDecoderFactory()
@@ -55,37 +50,62 @@ final class WebRTCManager: NSObject {
     }
 
     // MARK: - Local Media
-    func startLocalMedia(videoRenderer: RTCVideoRenderer? = nil) {
-        let audioSource = factory.audioSource(with: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
-        localAudioTrack = factory.audioTrack(with: audioSource, trackId: "audio0")
-
-        let videoSource = factory.videoSource()
-        
-
-        localVideoTrack = factory.videoTrack(with: videoSource, trackId: "video0")
-        if let renderer = videoRenderer {
-            localVideoTrack?.addRenderer(renderer)
+    func startLocalMedia(mediaMode: MediaMode = .audioVideo, videoRenderer: RTCVideoRenderer? = nil) {
+        // Start audio if mode includes audio
+        if mediaMode != .videoOnly {
+            if localAudioTrack == nil {
+                let audioSource = factory.audioSource(with: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil))
+                localAudioTrack = factory.audioTrack(with: audioSource, trackId: "audio0")
+            }
         }
 
-        #if targetEnvironment(simulator)
-            // ✅ Skip capture on simulator — no camera hardware
-            print("[WebRTC] Simulator detected, skipping camera capture")
-        #else
-            capturer = RTCCameraVideoCapturer(delegate: videoSource)
-            guard let device = selectFrontCamera() else { return }
-            let format = selectBestFormat(for: device)
-            let fps = selectBestFPS(for: format)
-            capturer?.startCapture(with: device, format: format, fps: fps)
-        #endif
+        // Start video if mode includes video
+        if mediaMode != .audioOnly {
+            if localVideoTrack == nil {
+                let videoSource = factory.videoSource()
+                localVideoTrack = factory.videoTrack(with: videoSource, trackId: "video0")
+                if let renderer = videoRenderer {
+                    localVideoTrack?.addRenderer(renderer)
+                }
+
+                #if targetEnvironment(simulator)
+                    print("[WebRTC] Simulator detected, skipping camera capture")
+                    let cap = RTCVideoCapturer(delegate: videoSource)
+                    simulatorCapturer = cap
+                    videoSource.adaptOutputFormat(toWidth: 640, height: 480, fps: 30)
+                    if let plugin = simulatorPlugin {
+                        let feed = SimulatorFrameFeed(source: videoSource, capturer: cap)
+                        plugin.start(feed: feed)
+                        print("[WebRTC] Simulator plugin started")
+                    }
+                #else
+                    let cap = RTCCameraVideoCapturer(delegate: videoSource)
+                    capturer = cap
+                    guard let device = selectFrontCamera() else { return }
+                    let format = selectBestFormat(for: device)
+                    let fps = selectBestFPS(for: format)
+                    cap.startCapture(with: device, format: format, fps: fps)
+                #endif
+            }
+        }
     }
 
     func stopLocalMedia() {
         capturer?.stopCapture()
         capturer = nil
+        #if targetEnvironment(simulator)
+        simulatorPlugin?.stop()
+        simulatorCapturer = nil
+        #endif
         localVideoTrack = nil
         localAudioTrack = nil
     }
 
+    // MARK: - Public Accessors
+    public var currentLocalVideoTrack: RTCVideoTrack? {
+        return localVideoTrack
+    }
+    
     func setLocalVideoRenderer(_ renderer: RTCVideoRenderer) {
         localVideoTrack?.addRenderer(renderer)
     }
@@ -99,13 +119,58 @@ final class WebRTCManager: NSObject {
         capturer?.captureSession.isRunning == true ? nil : capturer?.stopCapture()
     }
 
+    
+//    func setVideoEnabled00(_ enabled: Bool) {
+//        localVideoTrack?.isEnabled = enabled
+//
+//        if !enabled {
+//            capturer?.stopCapture()
+//        } else {
+//            // restart with current camera
+//            guard let device = cameraDevice(position: currentCameraPosition),
+//                  let capturer = capturer else { return }
+//
+//            let format = selectBestFormat(for: device)
+//            let fps = selectBestFPS(for: format)
+//
+//            capturer.startCapture(with: device, format: format, fps: fps)
+//        }
+//    }
+    
+    private func cameraDevice(position: AVCaptureDevice.Position) -> AVCaptureDevice? {
+        RTCCameraVideoCapturer.captureDevices().first { $0.position == position }
+    }
+    
+    func switchCamera(_ rear: Bool) {
+        let targetPosition: AVCaptureDevice.Position = rear ? .back : .front
+        
+        // ✅ Avoid unnecessary switch
+        guard currentCameraPosition != targetPosition else {
+            print("[WebRTC] Camera already in desired position: \(targetPosition)")
+            return
+        }
+        
+        guard let capturer = capturer else { return }
+        guard let device = cameraDevice(position: targetPosition) else { return }
+        
+        let format = selectBestFormat(for: device)
+        let fps = selectBestFPS(for: format)
+        
+        currentCameraPosition = targetPosition
+        
+        capturer.stopCapture { [weak self] in
+            guard let self else { return }
+            capturer.startCapture(with: device, format: format, fps: fps)
+        }
+    }
+    
     // MARK: - PeerConnection Lifecycle
-    func createPublisherPeerConnection(handleId: UInt64) -> RTCPeerConnection {
+    func createPublisherPeerConnection(handleId: UInt64, mediaMode: MediaMode = .audioVideo) -> RTCPeerConnection {
         let pc = makePeerConnection(handleId: handleId)
-        if let audioTrack = localAudioTrack {
+        if mediaMode != .videoOnly, let audioTrack = localAudioTrack {
             pc.add(audioTrack, streamIds: ["stream0"])
         }
-        if let videoTrack = localVideoTrack {
+        if mediaMode != .audioOnly, let videoTrack = localVideoTrack {
             pc.add(videoTrack, streamIds: ["stream0"])
         }
         return pc
@@ -144,12 +209,14 @@ final class WebRTCManager: NSObject {
         }
     }
 
-    func createAnswer(handleId: UInt64) {
+    func createAnswer(handleId: UInt64, mediaMode: MediaMode = .audioVideo) {
         guard let pc = peerConnections[handleId] else { return }
+        let audio = mediaMode != .videoOnly
+        let video = mediaMode != .audioOnly
         let constraints = RTCMediaConstraints(
             mandatoryConstraints: [
-                "OfferToReceiveAudio": "true",
-                "OfferToReceiveVideo": "true"
+                "OfferToReceiveAudio": audio ? "true" : "false",
+                "OfferToReceiveVideo": video ? "true" : "false"
             ],
             optionalConstraints: nil
         )
@@ -172,7 +239,8 @@ final class WebRTCManager: NSObject {
     // MARK: - Private Helpers
     private func makePeerConnection(handleId: UInt64) -> RTCPeerConnection {
         let config = RTCConfiguration()
-        config.iceServers = WebRTCManager.iceServers
+//        config.iceServers = WebRTCManager.iceServers
+        config.iceServers = SDKConfig.buildIceServers(from: config0.iceServersDictionary)
         config.sdpSemantics = .unifiedPlan
         config.continualGatheringPolicy = .gatherContinually
         config.bundlePolicy = .maxBundle
@@ -203,6 +271,7 @@ final class WebRTCManager: NSObject {
         let maxFPS = format.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 30
         return Int(min(maxFPS, 30))
     }
+    
 }
 
 // MARK: - RTCPeerConnectionDelegate
@@ -242,8 +311,7 @@ extension WebRTCManager: RTCPeerConnectionDelegate {
         pcLock.lock()
         let feedId = feedIdMap[handleId] ?? handleId
         pcLock.unlock()
-        DispatchQueue.main.async {
-            self.delegate?.webRTCManager(self, didReceiveRemoteTrack: videoTrack, forFeedId: feedId)
-        }
+        delegate?.webRTCManager(self, didReceiveRemoteTrack: videoTrack, forFeedId: feedId)
     }
 }
+

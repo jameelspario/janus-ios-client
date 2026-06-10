@@ -1,14 +1,3 @@
-//
-//  JanusSession.swift
-//  janus-test
-//
-//  Created by jameel on 03/03/26.
-//
-
-// JanusSession.swift
-// Manages a single Janus session: creates session, attaches plugin handles,
-// routes all incoming WebSocket messages, and dispatches transactions.
-
 import Foundation
 import WebRTC
 
@@ -32,10 +21,12 @@ final class JanusSession: NSObject {
     private var transactions: [String: ([String: Any]) -> Void] = [:]
     private let transactionLock = NSLock()
     private var keepAliveTimer: Timer?
+    
+    var DEBUG = true
 
     // MARK: - Init
     init(url: URL) {
-        client = StarScreamClient()
+        client = StarScreamClient(url: url)
         super.init()
         client.delegate = self
     }
@@ -207,6 +198,7 @@ final class JanusSession: NSObject {
             // Message acknowledged; async event will follow
             break
         case "event":
+            log("- event - \(txId) -")
             if !txId.isEmpty { resolveTransaction(id: txId, response: json) }
             delegate?.janusSession(self, didReceiveEvent: json, forHandle: handleId)
             if let jsep = json["jsep"] as? [String: Any] {
@@ -218,6 +210,7 @@ final class JanusSession: NSObject {
             let type = json["type"] as? String ?? "unknown"
             let receiving = json["receiving"] as? Bool ?? false
             print("[Janus] Media (\(type)) receiving=\(receiving) handle=\(handleId)")
+            
         case "slowlink":
             print("[Janus] Slowlink for handle \(handleId)")
         case "hangup":
@@ -233,6 +226,12 @@ final class JanusSession: NSObject {
             break
         }
     }
+    
+    func log(_ items: Any...){
+        if DEBUG {
+            print(items)
+        }
+     }
 }
 
 // MARK: - SignalingConnectionStateDelegate
@@ -259,3 +258,4 @@ extension JanusSession: SignalingConnectionStateDelegate {
         }
     }
 }
+

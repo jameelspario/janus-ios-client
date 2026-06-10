@@ -1,9 +1,3 @@
-//
-//  StarScreamClient.swift
-//  janus-test
-//
-//  Created by jameel on 03/03/26.
-//
 
 import Foundation
 import Starscream
@@ -32,15 +26,16 @@ protocol StarScreamConnection {
 }
 final class StarScreamClient:StarScreamConnection {
     weak var delegate: SignalingConnectionStateDelegate?
-    private var webSocket: WebSocket? = nil
+    private var webSocket: Starscream.WebSocket? = nil
     
     init(url: URL = URL1!) {
         var request = URLRequest(url: url)
+        print("url >> \(url)")
         let protocols = ["janus-protocol"]
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
+//        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+//        request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue(protocols.joined(separator: ","), forHTTPHeaderField: "Sec-WebSocket-Protocol")
-        webSocket = WebSocket(request: request)
+        webSocket = Starscream.WebSocket(request: request)
         webSocket?.delegate = self
     }
     
